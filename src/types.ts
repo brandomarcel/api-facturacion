@@ -59,10 +59,16 @@ export interface EmitInvoiceInput {
 }
 
 export interface EmitInvoiceOutput {
-  status: 'SIGNED'|'SENT'|'PROCESSING'|'AUTHORIZED'|'NOT_AUTHORIZED'|'ERROR';
+  status: 'AUTHORIZED' | 'PROCESSING' | 'NOT_AUTHORIZED' | 'ERROR';
   accessKey?: string;
   authorization?: { number: string; date: string };
   xml_signed_base64?: string;
   xml_authorized_base64?: string;
   messages?: string[];
+}
+
+export interface IdempotencyRecord {
+  response: EmitInvoiceOutput;
+  timestamp: number;
+  ttl?: number;
 }

@@ -24,36 +24,66 @@ export function isRecibida(resp: any): boolean {
 }
 
 export function parseAutorizacion(resp: any) {
-  const s = JSON.stringify(resp);
-  console.log(s); // Para depurar y ver qué se está recibiendo
+  // Para depurar sin reventar por objetos grandes:
+  try { console.log('SRI raw:', JSON.stringify(resp)); } catch {}
 
-  let autorizado = false; // Inicializamos como no autorizado por defecto
+  let autorizado = false;
   let number = '', date = '', xmlAut = '', errorMsg = '';
 
-  const aut = resp?.RespuestaAutorizacionComprobante?.autorizaciones?.autorizacion
-           ?? resp?.autorizaciones?.autorizacion;
-  const first = Array.isArray(aut) ? aut[0] : aut;
+  // Soportar ambas formas
+  const autRoot =
+    resp?.RespuestaAutorizacionComprobante?.autorizaciones?.autorizacion ??
+    resp?.autorizaciones?.autorizacion;
+
+  // Puede venir como array o como objeto
+  const first = Array.isArray(autRoot) ? autRoot[0] : autRoot;
+console.log('SRI estado crudo:', JSON.stringify(first?.estado));
+console.log('SRI mensajes tipo:', Array.isArray(first?.mensajes?.mensaje) ? 'array' : typeof first?.mensajes?.mensaje);
 
   if (first) {
-    const estado = (first.estado || '').toString().toUpperCase();
+    const estado = (first.estado ?? '').toString().trim().toUpperCase();
+
     if (estado === 'AUTORIZADO') {
       autorizado = true;
     } else if (estado === 'NO AUTORIZADO') {
-      // Si no está autorizado, extraemos el mensaje de error
-      errorMsg = first?.mensajes?.mensaje?.mensaje ?? 'No autorizado sin mensaje específico';
+      // Unificar mensajes de error (array u objeto)
+      const mensajes = first?.mensajes?.mensaje;
+      if (Array.isArray(mensajes)) {
+        errorMsg = mensajes
+          .map((m) =>
+            [m?.identificador, m?.mensaje, m?.informacionAdicional]
+              .filter(Boolean)
+              .join(': ')
+          )
+          .join(' | ');
+      } else if (mensajes) {
+        errorMsg = [mensajes?.identificador, mensajes?.mensaje, mensajes?.informacionAdicional]
+          .filter(Boolean)
+          .join(': ');
+      } else {
+        errorMsg = 'No autorizado sin mensaje específico';
+      }
+    } else {
+      // Otros estados inesperados
+      errorMsg = `Estado SRI: ${estado || 'DESCONOCIDO'}`;
     }
+
     number = first.numeroAutorizacion || number;
     date   = first.fechaAutorizacion  || date;
 
+    // Extraer XML del comprobante (puede venir con o sin CDATA)
     if (first.comprobante) {
-      const m = /<!\[CDATA\[(.*)\]\]>/s.exec(first.comprobante);
-      xmlAut = m ? m[1] : first.comprobante;
+      const c = String(first.comprobante);
+      const m = /<!\[CDATA\[([\s\S]*?)\]\]>/.exec(c); // no-greedy y seguro
+      xmlAut = (m ? m[1] : c).trim();
     }
+  } else {
+    errorMsg = 'Respuesta del SRI sin nodo de autorización';
   }
 
-  // Si no está autorizado, devolvemos también el error
   return { autorizado, number, date, xmlAut, errorMsg };
 }
+
 
 if (!soap || typeof (soap as any).createClientAsync !== 'function') {
   throw new Error('SOAP no cargó correctamente. Revisa el import y que "soap" esté instalado.');
