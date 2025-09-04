@@ -230,7 +230,7 @@ export async function emitirFacturaDesdeXML(payload: {
   const idempotencyKey = payload.idempotency_key || accessKey;
   const reqHash = createHash('sha256').update(xml).digest('hex');
 
-  const env = payload.env || ambiente || 'test';
+  const env:any = payload.env || ambiente || 'test';
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
 
   const cached = await getCachedResponse(idempotencyKey);
@@ -246,7 +246,7 @@ export async function emitirFacturaDesdeXML(payload: {
   });
 
   try {
-    const signedXml = await signXML(xml, certificate.p12_base64, password);
+    const signedXml = await signXML(xml, p12Base64, password);
 
     const rec = await recepcion(recepcionUrl, signedXml);
     if (!isRecibida(rec)) {
