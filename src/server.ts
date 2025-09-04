@@ -7,8 +7,6 @@ import { DOMParser, XMLSerializer } from '@xmldom/xmldom';
 import * as xpath from 'xpath';
 import { webcrypto } from 'crypto';
 import { setNodeDependencies } from 'xml-core';
-import { generateInvoiceXML } from 'open-factura-ec';
-import { getSriUrls } from './sri-config';
 setNodeDependencies({
   DOMParser,
   XMLSerializer,
@@ -21,87 +19,28 @@ setNodeDependencies({
 // 3) Resto de imports
 import express from 'express';
 import { z } from 'zod';
-import { emitirFactura } from './emit';
+import { emitirFactura, emitirFacturaDesdeXML, emitirNotaCredito } from './emit';
 import { autorizacion, parseAutorizacion } from './sri';
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// --- Schema de Zod para el nuevo formato (XML directo) ---
-const schema = z.object({
-  // Campos básicos
+// --- Schema Zod para FACTURA (JSON canónico) ---
+const invoiceSchema = z.object({
   idempotency_key: z.string().min(6).optional(),
   env: z.enum(['test','prod']).optional(),
   numeric_code: z.string().regex(/^\d{8}$/).optional(),
-  
-  // Estructura del XML
-  version: z.string().optional().default("2.1.0"),
+
+  version: z.string().optional().default('2.1.0'),
   certificate: z.object({
     p12_base64: z.string().min(1),
     password: z.string().min(1)
-  }),
-  infoTributaria: z.object({
-    ambiente: z.string(),
-    tipoEmision: z.string(),
-    razonSocial: z.string(),
-    nombreComercial: z.string().optional(),
-    ruc: z.string().regex(/^\d{13}$/),
-    codDoc: z.string().optional(),
-    estab: z.string().regex(/^\d{3}$/),
-    ptoEmi: z.string().regex(/^\d{3}$/),
-    secuencial: z.string().regex(/^\d{9}$/),
-    dirMatriz: z.string(),
-    contribuyenteRimpe: z.string().optional(),
-    obligadoContabilidad: z.string().optional()
-  }),
-  infoFactura: z.object({
-    fechaEmision: z.string(),
-    dirEstablecimiento: z.string(),
-    obligadoContabilidad: z.string().optional(),
-    tipoIdentificacionComprador: z.string(),
-    razonSocialComprador: z.string(),
-    identificacionComprador: z.string(),
-    direccionComprador: z.string().optional(),
-    totalSinImpuestos: z.number(),
-    totalDescuento: z.number(),
-    totalConImpuestos: z.array(z.object({
-      codigo: z.string(),
-      codigoPorcentaje: z.string(),
-      baseImponible: z.number(),
-      valor: z.number(),
-      tarifa: z.number().optional()
-    })),
-    propina: z.number().optional(),
-    importeTotal: z.number(),
-    moneda: z.string().optional(),
-    pagos: z.array(z.object({
-      formaPago: z.string(),
-      total: z.number(),
-      plazo: z.string().optional(),
-      unidadTiempo: z.string().optional()
-    }))
-  }),
-  detalles: z.array(z.object({
-    codigoPrincipal: z.string(),
-    descripcion: z.string(),
-    cantidad: z.number(),
-    precioUnitario: z.number(),
-    descuento: z.number().optional(),
-    precioTotalSinImpuesto: z.number(),
-    impuestos: z.array(z.object({
-      codigo: z.string(),
-      codigoPorcentaje: z.string(),
-      tarifa: z.number().optional(),
-      baseImponible: z.number().optional(),
-      valor: z.number().optional()
-    }))
-  })),
-  infoAdicional: z.object({
-    campos: z.array(z.object({
-      nombre: z.string(),
-      valor: z.string()
-    }))
-  }).optional()
+  }).passthrough(),
+
+  infoTributaria: z.any(),
+  infoFactura: z.any(),
+  detalles: z.any(),
+  infoAdicional: z.any().optional()
 });
 
 // --- Schema para el formato legacy ---
@@ -159,15 +98,12 @@ const legacySchema = z.object({
   })
 });
 
-// --- Función para transformar formato legacy a nuevo formato ---
+// --- Transformador legacy → nuevo ---
 function transformLegacyToNewFormat(legacyData: z.infer<typeof legacySchema>) {
   const { company, certificate, invoice, env, idempotency_key, numeric_code } = legacyData;
-  
-  // Convertir fecha de ISO a formato dd/mm/yyyy
   const [year, month, day] = invoice.issueDate.split('-');
   const fechaEmision = `${day}/${month}/${year}`;
-  
-  // Transformar items
+
   const detalles = invoice.items.map(item => ({
     codigoPrincipal: item.code,
     descripcion: item.description,
@@ -177,24 +113,22 @@ function transformLegacyToNewFormat(legacyData: z.infer<typeof legacySchema>) {
     precioTotalSinImpuesto: item.qty * item.unit_price - (item.discount || 0),
     impuestos: (item.taxes || []).map(tax => ({
       codigo: tax.type_code,
-      codigoPorcentaje: tax.type_code === '2' ? '2' : '0', // Asumimos IVA
+      codigoPorcentaje: tax.type_code === '2' ? '2' : '0',
       tarifa: tax.rate,
       baseImponible: item.qty * item.unit_price - (item.discount || 0),
       valor: (item.qty * item.unit_price - (item.discount || 0)) * (tax.rate / 100)
     }))
   }));
-  
-  // Calcular totales
+
   const totalSinImpuestos = invoice.totals.subtotal_0;
   const totalDescuento = invoice.totals.total_discount;
-  
-  // Transformar impuestos
-  const totalConImpuestos = [];
+
+  const totalConImpuestos: any[] = [];
   for (const [key, value] of Object.entries(invoice.totals)) {
     if (key.startsWith('subtotal_') && key !== 'subtotal_0') {
       const rate = parseInt(key.split('_')[1]);
       totalConImpuestos.push({
-        codigo: '2', // IVA
+        codigo: '2',
         codigoPorcentaje: rate === 12 ? '2' : rate === 15 ? '4' : '0',
         baseImponible: value as number,
         valor: (value as number) * (rate / 100),
@@ -202,20 +136,19 @@ function transformLegacyToNewFormat(legacyData: z.infer<typeof legacySchema>) {
       });
     }
   }
-  
-  // Transformar pagos
-  const pagos = invoice.totals.payments.map(p => ({
+
+  const pagos = (invoice.totals.payments as any[]).map(p => ({
     formaPago: p.code,
     total: p.amount,
     plazo: '0',
     unidadTiempo: 'dias'
   }));
-  
+
   return {
     idempotency_key,
     env,
     numeric_code,
-    version: "2.1.0",
+    version: '2.1.0',
     certificate,
     infoTributaria: {
       ambiente: env === 'prod' ? '2' : '1',
@@ -248,14 +181,27 @@ function transformLegacyToNewFormat(legacyData: z.infer<typeof legacySchema>) {
       pagos
     },
     detalles,
-    infoAdicional: invoice.additional ? {
-      campos: invoice.additional
-    } : undefined
+    infoAdicional: invoice.additional ? { campos: invoice.additional } : undefined
   };
 }
 
+// --- Schema Zod para NOTA DE CRÉDITO (JSON canónico) ---
+const creditNoteSchema = z.object({
+  idempotency_key: z.string().min(6).optional(),
+  env: z.enum(['test','prod']).optional(),
+  numeric_code: z.string().regex(/^\d{8}$/).optional(),
+  version: z.string().optional().default('1.1.0'),
+  certificate: z.object({
+    p12_base64: z.string().optional(),
+    password: z.string()
+  }).passthrough(),
+  infoTributaria: z.any(),
+  infoNotaCredito: z.any(),
+  detalles: z.any(),
+  infoAdicional: z.any().optional()
+});
 
-// Función para obtener configuración SRI con validaciones
+// --- Config SRI local (para /status y /config) ---
 function getSriConfig(env: 'test' | 'prod') {
   const config = {
     test: {
@@ -275,35 +221,32 @@ function getSriConfig(env: 'test' | 'prod') {
       }
     }
   };
-  
-  // Validar configuración
   if (env === 'test') {
     if (!config.test.recepcion || !config.test.autorizacion) {
-      console.warn('Configuración de pruebas no completa. Verifica las variables SRI_RECEPCION_TEST y SRI_AUTORIZACION_TEST');
+      console.warn('Configuración TEST incompleta: SRI_RECEPCION_TEST / SRI_AUTORIZACION_TEST');
     }
   } else {
     if (!config.prod.recepcion || !config.prod.autorizacion) {
-      console.warn('Configuración de producción no completa. Verifica las variables SRI_RECEPCION_PROD y SRI_AUTORIZACION_PROD');
+      console.warn('Configuración PROD incompleta: SRI_RECEPCION_PROD / SRI_AUTORIZACION_PROD');
     }
   }
-  
   return config[env];
 }
-// Endpoint de emisión
+
+// ---------- Endpoints ----------
+
+// Emitir FACTURA (JSON canónico)
 app.post('/api/v1/invoices/emit', async (req, res) => {
   try {
-    console.log('Received payload:', JSON.stringify(req.body, null, 2));
-
-    const newFormatParse = schema.safeParse(req.body);
+    const newFormatParse = invoiceSchema.safeParse(req.body);
+	console.log('Received payload:', newFormatParse);
     if (newFormatParse.success) {
-      console.log('Processing as new format');
       const out = await emitirFactura(newFormatParse.data);
       return res.json(out);
     }
 
     const legacyFormatParse = legacySchema.safeParse(req.body);
     if (legacyFormatParse.success) {
-      console.log('Processing as legacy format, transforming to new format');
       const transformedData = transformLegacyToNewFormat(legacyFormatParse.data);
       const out = await emitirFactura(transformedData);
       return res.json(out);
@@ -313,100 +256,100 @@ app.post('/api/v1/invoices/emit', async (req, res) => {
       ...(newFormatParse.error?.errors ?? []),
       ...(legacyFormatParse.error?.errors ?? []),
     ];
-
-    return res.status(400).json({
-      status: 'ERROR',
-      message: 'Formato de datos inválido',
-      issues: errors,
-    });
+    return res.status(400).json({ status: 'ERROR', message: 'Formato de datos inválido', issues: errors });
   } catch (e: any) {
     console.error('Error al emitir factura:', e);
-    return res.status(500).json({
-      status: 'ERROR',
-      message: e?.message || 'Internal Error',
-      details: e?.stack ? String(e.stack).split('\n').slice(0, 3).join('\n') : undefined,
-    });
+    return res.status(500).json({ status: 'ERROR', message: e?.message || 'Internal Error' });
   }
 });
 
+// Emitir FACTURA desde XML crudo
+app.post('/api/v1/invoices/emit-xml', async (req, res) => {
+  try {
+    const out = await emitirFacturaDesdeXML({
+      xml: req.body?.xml,
+      env: req.body?.env,
+      idempotency_key: req.body?.idempotency_key,
+      certificate: req.body?.certificate,
+      urlFirma: req.body?.urlFirma,
+      clave: req.body?.clave
+    });
+    return res.json(out);
+  } catch (e: any) {
+    console.error('Error en /emit-xml:', e);
+    return res.status(500).json({ status: 'ERROR', message: e?.message || 'Internal Error' });
+  }
+});
 
-// Endpoint de status
-// --- MEJORA: Endpoint de status con soporte para test y prod ---
+// Emitir NOTA DE CRÉDITO (JSON canónico)
+app.post('/api/v1/credit-notes/emit', async (req, res) => {
+  try {
+  
+  
+    const parsed = creditNoteSchema.safeParse(req.body);
+	console.log('Received payload:', parsed);
+    if (!parsed.success) {
+      return res.status(400).json({ status: 'ERROR', message: 'Formato de datos inválido', issues: parsed.error.errors });
+    }
+    const out = await emitirNotaCredito(parsed.data);
+    return res.json(out);
+  } catch (e: any) {
+    console.error('Error al emitir nota de crédito:', e);
+    return res.status(500).json({ status: 'ERROR', message: e?.message || 'Internal Error' });
+  }
+});
+
+// Endpoint de status (sirve para cualquier clave)
 app.get('/api/v1/invoices/:accessKey/status', async (req, res) => {
   try {
     const { accessKey } = req.params;
-    const { env } = req.query; // Nuevo parámetro de query para especificar ambiente
-    
+    const { env } = req.query as { env?: 'test'|'prod' };
+
     if (!/^\d{49}$/.test(accessKey)) {
-      return res.status(400).json({ 
-        status: 'ERROR', 
-        messages: ['Clave de acceso inválida.'] 
-      });
+      return res.status(400).json({ status: 'ERROR', messages: ['Clave de acceso inválida.'] });
     }
 
-    // Determinar el ambiente: query param > primer dígito de accessKey > default test
-    let determinedEnv: 'test' | 'prod' = 'test';
-    
-    if (env === 'test' || env === 'prod') {
-      determinedEnv = env;
-    } else {
-      // Si no se especifica en query, determinar por el primer dígito de la clave
-      determinedEnv = accessKey[0] === '1' ? 'test' : 'prod';
-    }
-
+    const determinedEnv: 'test' | 'prod' = env === 'prod' ? 'prod' : 'test';
     console.log(`Consultando estado en ambiente: ${determinedEnv}`);
-    
-    // Obtener configuración del ambiente determinado
+
     const sriConfig = getSriConfig(determinedEnv);
-    
-    // Validar que tenemos las URLs configuradas
     if (!sriConfig.autorizacion) {
-      return res.status(500).json({
-        status: 'ERROR',
-        messages: [`URL de autorización no configurada para ambiente: ${determinedEnv}`]
-      });
+      return res.status(500).json({ status: 'ERROR', messages: [`URL de autorización no configurada para ambiente: ${determinedEnv}`] });
     }
 
     const authResponse = await autorizacion(sriConfig.autorizacion, accessKey);
-    console.log('authResponse', authResponse);
-    
-    const { autorizado, number, date, xmlAut } = parseAutorizacion(authResponse);
+    const parsed = parseAutorizacion(authResponse);
 
-    if (autorizado) {
+    if (parsed.estado === 'AUTORIZADO') {
       return res.json({
         status: 'AUTHORIZED',
         accessKey,
-        environment: determinedEnv, // Incluir el ambiente en la respuesta
-        authorization: { number, date },
-        xml_authorized_base64: xmlAut ? Buffer.from(xmlAut).toString('base64') : undefined,
+        environment: determinedEnv,
+        authorization: { number: parsed.number, date: parsed.date },
+        xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
       });
     }
-
-    // Revisa si la factura aún está en procesamiento
-    const responseString = JSON.stringify(authResponse);
-    if (responseString.includes('PROCESANDO')) {
+    if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
       return res.json({
         status: 'PROCESSING',
         accessKey,
         environment: determinedEnv,
-        messages: ['El comprobante está siendo procesado por el SRI.'],
+        messages: [parsed.errorMsg || 'El comprobante todavía no tiene autorización (pendiente).'],
+      });
+    }
+    if (parsed.estado === 'NO AUTORIZADO') {
+      return res.json({
+        status: 'NOT_AUTHORIZED',
+        accessKey,
+        environment: determinedEnv,
+        messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
       });
     }
 
-    // Si no está autorizada ni en proceso, entonces no está autorizada.
-    return res.json({
-      status: 'NOT_AUTHORIZED',
-      accessKey,
-      environment: determinedEnv,
-      messages: ['El comprobante no fue autorizado.'],
-    });
-
+    return res.json({ status: 'UNKNOWN', accessKey, environment: determinedEnv, messages: ['Estado de autorización desconocido.'] });
   } catch (e: any) {
     console.error('Error al consultar estado:', e);
-    return res.status(500).json({ 
-      status: 'ERROR', 
-      messages: [e?.message || 'Internal Error'] 
-    });
+    return res.status(500).json({ status: 'ERROR', messages: [e?.message || 'Internal Error'] });
   }
 });
 
@@ -414,7 +357,6 @@ app.get('/api/v1/invoices/:accessKey/status', async (req, res) => {
 app.get('/api/v1/config', (req, res) => {
   const testConfig = getSriConfig('test');
   const prodConfig = getSriConfig('prod');
-  
   res.json({
     test: {
       recepcion: testConfig.recepcion ? 'Configurada' : 'No configurada',
@@ -429,11 +371,10 @@ app.get('/api/v1/config', (req, res) => {
   });
 });
 
-
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
+  res.json({
+    status: 'OK',
     timestamp: new Date().toISOString(),
     service: 'SRI API'
   });

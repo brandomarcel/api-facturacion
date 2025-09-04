@@ -1,275 +1,417 @@
 import { EmitInvoiceOutput } from './types';
 import { recepcion, autorizacion, isRecibida, parseAutorizacion } from './sri';
 import * as dotenv from 'dotenv';
-import { generateInvoiceXML, signXML, InvoiceVersion, Invoice } from 'open-factura-ec';
+import { generateInvoiceXML, generateCreditNoteXML, signXML, InvoiceVersion, Invoice } from 'open-factura-ec';
 import { createHash } from 'crypto';
 import { createClient } from 'redis';
 import * as fs from 'fs';
-import * as path from 'path';
+import * as http from 'http';
+import * as https from 'https';
 import { getSriUrls } from './sri-config';
-// Configuración de entorno
-dotenv.config();
 
-// Constantes
+dotenv.config();
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const DEFAULT_VERSION: InvoiceVersion = "2.1.0";
 
-// Cliente Redis
+
+function numeric8FromKey(key: string): string {
+  // Derivar 8 dígitos decimales estables desde el hash
+  const hex = createHash('md5').update(key).digest('hex');   // 32 hex
+  const asInt = parseInt(hex.slice(0, 8), 16);               // 32 bits
+  return (asInt % 100000000).toString().padStart(8, '0');    // 8 dígitos 0-9
+}
+
 const redisClient = createClient({
   url: REDIS_URL,
-  socket: {
-    reconnectStrategy: (retries) => Math.min(retries * 50, 2000)
-  }
+  socket: { reconnectStrategy: (retries) => Math.min(retries * 50, 2000) }
 });
-
-// Manejo de errores de Redis
-redisClient.on('error', (err) => {
-  console.error('Redis Client Error:', err);
-});
-
-// Conectar a Redis al iniciar
+redisClient.on('error', (err) => console.error('Redis Client Error:', err));
 let redisConnected = false;
 (async () => {
-  try {
-    await redisClient.connect();
-    redisConnected = true;
-    console.log('Conectado a Redis correctamente');
-  } catch (error) {
-    console.error('Error conectando a Redis, usando almacenamiento en memoria:', error);
-  }
+  try { await redisClient.connect(); redisConnected = true; console.log('Conectado a Redis'); }
+  catch (e) { console.error('Redis no disponible, usando memoria:', e); }
 })();
-
-// Almacén de respaldo en memoria (solo si Redis falla)
-const memoryStore = new Map<string, { response: EmitInvoiceOutput, timestamp: number }>();
-
-// Limpiar entradas antiguas de memoria periódicamente
+type CachedResponse = EmitInvoiceOutput & { payload_hash?: string };
+const memoryStore = new Map<string, { response: CachedResponse, timestamp: number }>();
 setInterval(() => {
   const now = Date.now();
-  for (const [key, value] of memoryStore.entries()) {
-    if (now - value.timestamp > 24 * 60 * 60 * 1000) {
-      memoryStore.delete(key);
-    }
-  }
-}, 60 * 60 * 1000);
+  for (const [k,v] of memoryStore.entries()) if (now - v.timestamp > 24*60*60*1000) memoryStore.delete(k);
+}, 60*60*1000);
 
-// Utilidades
-function random8(): string {
-  return Math.floor(Math.random() * 1e8).toString().padStart(8, '0');
+function stableStringify(obj: any): string {
+  const all = new Set<string>(); JSON.stringify(obj, (k,v)=> (all.add(k), v));
+  return JSON.stringify(obj, Array.from(all).sort());
 }
-
-function ddmmyyyy(iso: string): string {
-  const d = new Date(iso);
-  const dd = String(d.getDate()).padStart(2, '0');
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const yyyy = d.getFullYear();
-  return `${dd}/${mm}/${yyyy}`;
+function payloadHash(payload: any): string {
+  const c = { ...payload }; delete c.idempotency_key;
+  return createHash('sha256').update(stableStringify(c)).digest('hex');
 }
-
-function round2(n: number): number {
-  return Math.round((n + Number.EPSILON) * 100) / 100;
-}
-
-function generateIdempotencyKey(payload: any): string {
-  // Crear una clave única basada en los datos de la factura
-  const { infoTributaria, infoFactura } = payload;
-  const uniqueString = `${infoTributaria.ruc}-${infoTributaria.estab}-${infoTributaria.ptoEmi}-${infoTributaria.secuencial}-${infoFactura.fechaEmision}`;
-  return createHash('md5').update(uniqueString).digest('hex');
-}
-
-async function getCachedResponse(key: string): Promise<EmitInvoiceOutput | null> {
+async function getCachedResponse(key: string): Promise<CachedResponse | null> {
   try {
-    if (redisConnected) {
-      const cached = await redisClient.get(`idempotency:${key}`);
-      return cached ? JSON.parse(cached) : null;
-    } else {
-      const cached = memoryStore.get(key);
-      return cached ? cached.response : null;
-    }
-  } catch (error) {
-    console.error('Error reading from cache:', error);
-    return null;
-  }
+    if (redisConnected) { const raw = await redisClient.get(`idempotency:${key}`); return raw ? JSON.parse(raw) : null; }
+    const m = memoryStore.get(key); return m ? m.response : null;
+  } catch { return null; }
 }
-
-async function setCachedResponse(key: string, response: EmitInvoiceOutput, ttlSeconds: number = 24 * 60 * 60): Promise<void> {
+async function setCachedResponse(key: string, response: CachedResponse, ttlSec = 24*60*60) {
   try {
-    if (redisConnected) {
-      await redisClient.setEx(`idempotency:${key}`, ttlSeconds, JSON.stringify(response));
-    } else {
-      memoryStore.set(key, { response, timestamp: Date.now() });
-    }
-  } catch (error) {
-    console.error('Error writing to cache:', error);
-  }
+    if (redisConnected) await redisClient.setEx(`idempotency:${key}`, ttlSec, JSON.stringify(response));
+    else memoryStore.set(key, { response, timestamp: Date.now() });
+  } catch (e) { console.error('Cache set error:', e); }
 }
 
-async function readCertificateFile(filePath: string): Promise<string> {
+async function fetchAsBase64(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https') ? https : http;
+    lib.get(url, (res) => {
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchAsBase64(res.headers.location).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+      const chunks: Buffer[] = [];
+      res.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('base64')));
+    }).on('error', reject);
+  });
+}
+async function readCertificateFile(filePath: string) {
+  const buf = await fs.promises.readFile(filePath);
+  return buf.toString('base64');
+}
+async function readCertificateFromInput(input: {
+  p12_base64?: string;
+  p12_url?: string;
+  p12_path?: string;
+  urlFirma?: string;
+}) {
+  const url = input.p12_url || input.urlFirma;
+  if (input.p12_base64 && !input.p12_base64.startsWith('http') && !input.p12_base64.startsWith('/') && !input.p12_base64.includes('\\')) {
+    return input.p12_base64;
+  }
+  if (url) return await fetchAsBase64(url);
+  const path = input.p12_path || input.p12_base64;
+  if (path && (path.startsWith('/') || path.includes('\\'))) return await readCertificateFile(path);
+  throw new Error('No se proporcionó certificado (p12_base64|p12_url|p12_path|urlFirma).');
+}
+
+function parseRecepcionMensajes(resp: any): string[] {
   try {
-    const fileContent = await fs.promises.readFile(filePath);
-    return fileContent.toString('base64');
-  } catch (error) {
-    throw new Error(`Error reading certificate file: ${error}`);
+    const raiz = resp?.respuestaRecepcionComprobante ?? resp?.RespuestaRecepcionComprobante ?? resp;
+    const comp = raiz?.comprobantes?.comprobante;
+    const first = Array.isArray(comp) ? comp[0] : comp;
+    const mensajes = first?.mensajes?.mensaje;
+    const list = Array.isArray(mensajes) ? mensajes : mensajes ? [mensajes] : [];
+    const textos = list.map((m: any) =>
+      [m?.identificador, m?.mensaje, m?.informacionAdicional].filter(Boolean).join(': ')
+    );
+    const estado = String(raiz?.estado || '').toUpperCase();
+    if (estado && !['RECIBIDA', ''].includes(estado)) textos.unshift(`Estado recepción: ${estado}`);
+    return textos.length ? textos : ['Recepción SRI devuelta sin mensajes.'];
+  } catch {
+    return ['No se pudieron parsear los mensajes de recepción.'];
   }
 }
 
-// Función principal
+function extractFromXml(xml: string) {
+  const key = /<\s*claveAcceso\s*>\s*(\d{49})\s*<\s*\/\s*claveAcceso\s*>/i.exec(xml)?.[1] ?? null;
+  const amb = /<\s*ambiente\s*>\s*([12])\s*<\s*\/\s*ambiente\s*>/i.exec(xml)?.[1] ?? null;
+  return { accessKey: key, ambiente: amb ? (amb === '2' ? 'prod' : 'test') : null };
+}
+
+// ======================= FACTURA (JSON) =======================
+
 export async function emitirFactura(payload: any): Promise<EmitInvoiceOutput> {
-  // Generar o obtener clave de idempotencia
-  const idempotencyKey = payload.idempotency_key || generateIdempotencyKey(payload);
-  
-  //VER AMBIENTE
+  const idempotencyKey = payload.idempotency_key || `${payload?.infoTributaria?.ruc}-${payload?.infoTributaria?.estab}-${payload?.infoTributaria?.ptoEmi}-${payload?.infoTributaria?.secuencial}-${payload?.infoFactura?.fechaEmision}`;
+  const reqHash = payloadHash(payload);
+
   const env = payload.env || 'test';
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
 
-  // Verificar si ya procesamos esta solicitud
-  const cachedResponse = await getCachedResponse(idempotencyKey);
-  if (cachedResponse) {
-    console.log(`Retornando respuesta idempotente para key: ${idempotencyKey}`);
-    return cachedResponse;
-  }
-  
-  const { version = DEFAULT_VERSION, infoTributaria, infoFactura, detalles, infoAdicional, certificate } = payload;
-  
-  // Validaciones básicas
-  if (!infoTributaria || !infoFactura || !detalles || !certificate) {
-    const errorResponse: EmitInvoiceOutput = {
-      status: 'ERROR',
-      messages: ['Datos incompletos en el payload']
-    };
-    return errorResponse;
-  }
-  
-  // Leer y codificar certificado si es una ruta de archivo
-  let p12Base64 = certificate.p12_base64;
-  if (p12Base64.startsWith('/') || p12Base64.includes('\\')) {
-    try {
-      p12Base64 = await readCertificateFile(p12Base64);
-    } catch (error) {
-      const errorResponse: EmitInvoiceOutput = {
-        status: 'ERROR',
-        messages: [`Error al leer el certificado: ${error}`]
-      };
-      return errorResponse;
-    }
-  }
-  
-  console.log('Procesando nueva factura con idempotency key:', idempotencyKey);
-  
-  const numericCode = random8();
-  
-  const sriInvoice: Invoice = {
-    version: version as InvoiceVersion,
-    infoTributaria,
-    infoFactura,
-    detalles,
-    infoAdicional
-  };
+  const cached = await getCachedResponse(idempotencyKey);
+  if (cached && cached.payload_hash === reqHash) return cached;
 
-console.log('p12Base64',p12Base64);
+  const { version = DEFAULT_VERSION, infoTributaria, infoFactura, detalles, infoAdicional, certificate } = payload;
+  if (!infoTributaria || !infoFactura || !detalles || !certificate) {
+    const e = { status: 'ERROR' as const, messages: ['Datos incompletos en el payload'], payload_hash: reqHash };
+    await setCachedResponse(idempotencyKey, e, 3600); return e;
+  }
+
+  let p12Base64 = await readCertificateFromInput({
+    p12_base64: certificate.p12_base64,
+    p12_url: (certificate as any).p12_url,
+    p12_path: (certificate as any).p12_path
+  });
+
+const numericCode =
+  typeof payload.numeric_code === 'string' && /^\d{8}$/.test(payload.numeric_code)
+    ? payload.numeric_code
+    : numeric8FromKey(idempotencyKey);
+
+  const sriInvoice: Invoice = { version: version as InvoiceVersion, infoTributaria, infoFactura, detalles, infoAdicional };
+
   try {
     const { xml, accessKey } = generateInvoiceXML(sriInvoice, numericCode);
     const signedXml = await signXML(xml, certificate.p12_base64, certificate.password);
-	  const rec = await recepcion(recepcionUrl, signedXml);
 
-  
+    const rec = await recepcion(recepcionUrl, signedXml);
     if (!isRecibida(rec)) {
-      const errorResponse: EmitInvoiceOutput = {
+      const msgs = parseRecepcionMensajes(rec);
+      const out: CachedResponse = {
         status: 'ERROR',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        messages: [JSON.stringify(rec)]
+        messages: msgs,
+        payload_hash: reqHash
       };
-      
-      // Guardar incluso respuestas de error para idempotencia (TTL más corto)
-      await setCachedResponse(idempotencyKey, errorResponse, 60 * 60); // 1 hora
-      
-      return errorResponse;
+      await setCachedResponse(idempotencyKey, out, 3600);
+      return out;
     }
 
-     const auth = await autorizacion(autorizacionUrl, accessKey);
-    const { autorizado, number, date, xmlAut } = parseAutorizacion(auth);
+    const auth = await autorizacion(autorizacionUrl, accessKey);
+    const parsed = parseAutorizacion(auth);
 
-    let result: EmitInvoiceOutput;
-    console.log(JSON.stringify(auth))
-    if (!autorizado) {
-      const str = JSON.stringify(auth);
-      const processing = str.includes('PROCESANDO');
-      result = {
-        status: processing ? 'PROCESSING' : 'NOT_AUTHORIZED',
+    if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
+      const out: CachedResponse = {
+        status: 'PROCESSING',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        messages: [str]
+        messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
+        payload_hash: reqHash
       };
-      
-      // Para estados de procesamiento, usar TTL más corto
-      const ttl = processing ? 5 * 60 : 24 * 60 * 60; // 5 minutos o 24 horas
-      await setCachedResponse(idempotencyKey, result, ttl);
-    } else {
-      result = {
-        status: 'AUTHORIZED',
-        accessKey,
-        authorization: { number, date },
-        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        xml_authorized_base64: xmlAut ? Buffer.from(xmlAut).toString('base64') : undefined,
-        messages: []
-      };
-      
-      // Para facturas autorizadas, guardar por más tiempo (24 horas)
-      await setCachedResponse(idempotencyKey, result, 24 * 60 * 60);
+      await setCachedResponse(idempotencyKey, out, 5 * 60);
+      return out;
     }
-    
-    return result;
-    
-  } catch (error) {
-    // Manejar errores inesperados (no guardar en caché para permitir reintentos)
-    const errorMessage = error instanceof Error ? error.message : 'Error desconocido';
-    console.error('Error inesperado al procesar factura:', error);
-    
-    const errorResponse: EmitInvoiceOutput = {
-      status: 'ERROR',
-      messages: [errorMessage]
+    if (parsed.estado === 'NO AUTORIZADO') {
+      const out: CachedResponse = {
+        status: 'NOT_AUTHORIZED',
+        accessKey,
+        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+        messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
+        payload_hash: reqHash
+      };
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+      return out;
+    }
+
+    const ok: CachedResponse = {
+      status: 'AUTHORIZED',
+      accessKey,
+      authorization: { number: parsed.number, date: parsed.date },
+      xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+      xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
+      messages: [],
+      payload_hash: reqHash
     };
-    
-    return errorResponse;
+    await setCachedResponse(idempotencyKey, ok, 24 * 60 * 60);
+    return ok;
+
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : 'Error desconocido';
+    return { status: 'ERROR', messages: [msg] };
   }
 }
 
-// Health check endpoint para verificar el estado del servicio
-export async function healthCheck(): Promise<{ status: string; redis: string; timestamp: string }> {
-  return {
-    status: 'OK',
-    redis: redisConnected ? 'CONNECTED' : 'DISCONNECTED',
-    timestamp: new Date().toISOString()
-  };
+// ======================= FACTURA (XML crudo) =======================
+
+export async function emitirFacturaDesdeXML(payload: {
+  xml: string;
+  env?: 'test' | 'prod';
+  idempotency_key?: string;
+  certificate?: { p12_base64?: string; p12_url?: string; p12_path?: string; password: string };
+  urlFirma?: string; // compat
+  clave?: string;    // compat
+}): Promise<EmitInvoiceOutput> {
+  const xml = (payload.xml || '').trim();
+  if (!xml) return { status: 'ERROR', messages: ['Falta el campo xml'] };
+
+  const { accessKey, ambiente } = extractFromXml(xml);
+  if (!accessKey) return { status: 'ERROR', messages: ['No se encontró <claveAcceso> en el XML.'] };
+
+  const idempotencyKey = payload.idempotency_key || accessKey;
+  const reqHash = createHash('sha256').update(xml).digest('hex');
+
+  const env = payload.env || ambiente || 'test';
+  const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
+
+  const cached = await getCachedResponse(idempotencyKey);
+  if (cached && cached.payload_hash === reqHash) return cached;
+
+  const password = payload.certificate?.password || payload.clave;
+  if (!password) return { status: 'ERROR', messages: ['Falta la contraseña del certificado (password/clave).'] };
+
+  const p12Base64 = await readCertificateFromInput({
+    p12_base64: payload.certificate?.p12_base64,
+    p12_url: payload.certificate?.p12_url || payload.urlFirma,
+    p12_path: payload.certificate?.p12_path
+  });
+
+  try {
+    const signedXml = await signXML(xml, certificate.p12_base64, password);
+
+    const rec = await recepcion(recepcionUrl, signedXml);
+    if (!isRecibida(rec)) {
+      const msgs = parseRecepcionMensajes(rec);
+      const out: CachedResponse = {
+        status: 'ERROR',
+        accessKey,
+        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+        messages: msgs.length ? msgs : [JSON.stringify(rec)],
+        payload_hash: reqHash
+      };
+      await setCachedResponse(idempotencyKey, out, 3600);
+      return out;
+    }
+
+    const auth = await autorizacion(autorizacionUrl, accessKey);
+    const parsed = parseAutorizacion(auth);
+
+    if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
+      const out: CachedResponse = {
+        status: 'PROCESSING',
+        accessKey,
+        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+        messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
+        payload_hash: reqHash
+      };
+      await setCachedResponse(idempotencyKey, out, 5 * 60);
+      return out;
+    }
+    if (parsed.estado === 'NO AUTORIZADO') {
+      const out: CachedResponse = {
+        status: 'NOT_AUTHORIZED',
+        accessKey,
+        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+        messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
+        payload_hash: reqHash
+      };
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+      return out;
+    }
+
+    const ok: CachedResponse = {
+      status: 'AUTHORIZED',
+      accessKey,
+      authorization: { number: parsed.number, date: parsed.date },
+      xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+      xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
+      messages: [],
+      payload_hash: reqHash
+    };
+    await setCachedResponse(idempotencyKey, ok, 24 * 60 * 60);
+    return ok;
+
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Error desconocido';
+    return { status: 'ERROR', messages: [msg] };
+  }
 }
 
-// Función para limpiar el caché de idempotencia (útil para testing)
+// ======================= NOTA DE CRÉDITO (JSON) =======================
+
+export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput> {
+  const idempotencyKey = payload.idempotency_key
+    || `${payload?.infoTributaria?.ruc}-${payload?.infoTributaria?.estab}-${payload?.infoTributaria?.ptoEmi}-${payload?.infoTributaria?.secuencial}-${payload?.infoNotaCredito?.fechaEmision}`;
+
+  const reqHash = payloadHash(payload);
+  const env = payload.env || 'test';
+  const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
+
+  const cached = await getCachedResponse(idempotencyKey);
+  if (cached && cached.payload_hash === reqHash) return cached;
+
+  const { infoTributaria, infoNotaCredito, detalles, infoAdicional, certificate } = payload;
+  if (!infoTributaria || !infoNotaCredito || !detalles || !certificate) {
+    const e = { status: 'ERROR' as const, messages: ['Datos incompletos para nota de crédito'], payload_hash: reqHash };
+    await setCachedResponse(idempotencyKey, e, 3600); return e;
+  }
+
+  const p12Base64 = await readCertificateFromInput({
+    p12_base64: certificate.p12_base64,
+    p12_url: (certificate as any).p12_url,
+    p12_path: (certificate as any).p12_path
+  });
+
+  try {
+const numericCode =
+  typeof payload.numeric_code === 'string' && /^\d{8}$/.test(payload.numeric_code)
+    ? payload.numeric_code
+    : numeric8FromKey(idempotencyKey);
+
+
+    const { xml, accessKey } = generateCreditNoteXML(
+      { version: (payload.version || '1.1.0'), infoTributaria, infoNotaCredito, detalles, infoAdicional } as any,
+      numericCode
+    );
+
+    const signedXml = await signXML(xml, certificate.p12_base64, certificate.password);
+
+    const rec = await recepcion(recepcionUrl, signedXml);
+    if (!isRecibida(rec)) {
+      const msgs = parseRecepcionMensajes(rec);
+      const out: CachedResponse = {
+        status: 'ERROR',
+        accessKey,
+        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+        messages: msgs,
+        payload_hash: reqHash
+      };
+      await setCachedResponse(idempotencyKey, out, 3600);
+      return out;
+    }
+
+    const auth = await autorizacion(autorizacionUrl, accessKey);
+    const parsed = parseAutorizacion(auth);
+
+    if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
+      const out: CachedResponse = {
+        status: 'PROCESSING',
+        accessKey,
+        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+        messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
+        payload_hash: reqHash
+      };
+      await setCachedResponse(idempotencyKey, out, 5 * 60);
+      return out;
+    }
+    if (parsed.estado === 'NO AUTORIZADO') {
+      const out: CachedResponse = {
+        status: 'NOT_AUTHORIZED',
+        accessKey,
+        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+        messages: [parsed.errorMsg || 'La nota de crédito no fue autorizada.'],
+        payload_hash: reqHash
+      };
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+      return out;
+    }
+
+    const ok: CachedResponse = {
+      status: 'AUTHORIZED',
+      accessKey,
+      authorization: { number: parsed.number, date: parsed.date },
+      xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+      xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
+      messages: [],
+      payload_hash: reqHash
+    };
+    await setCachedResponse(idempotencyKey, ok, 24 * 60 * 60);
+    return ok;
+
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Error desconocido';
+    return { status: 'ERROR', messages: [msg] };
+  }
+}
+
+// Utils de estado del servicio
+export async function healthCheck(): Promise<{ status: string; redis: string; timestamp: string }> {
+  return { status: 'OK', redis: redisConnected ? 'CONNECTED' : 'DISCONNECTED', timestamp: new Date().toISOString() };
+}
 export async function clearIdempotencyCache(): Promise<void> {
   if (redisConnected) {
-    // Nota: En producción, sería mejor usar un patrón de nombres más específico
     const keys = await redisClient.keys('idempotency:*');
-    if (keys.length > 0) {
-      await redisClient.del(keys);
-    }
-  } else {
-    memoryStore.clear();
-  }
+    if (keys.length) await redisClient.del(keys);
+  } else memoryStore.clear();
 }
-
-// Manejo de cierre graceful
-process.on('SIGINT', async () => {
-  console.log('Cerrando conexión Redis...');
-  if (redisConnected) {
-    await redisClient.quit();
-  }
-  process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-  console.log('Cerrando conexión Redis...');
-  if (redisConnected) {
-    await redisClient.quit();
-  }
-  process.exit(0);
-});
+process.on('SIGINT', async () => { if (redisConnected) await redisClient.quit(); process.exit(0); });
+process.on('SIGTERM', async () => { if (redisConnected) await redisClient.quit(); process.exit(0); });
