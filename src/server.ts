@@ -20,7 +20,8 @@ setNodeDependencies({
 import express from 'express';
 import { z } from 'zod';
 import { emitirFactura, emitirFacturaDesdeXML, emitirNotaCredito } from './emit';
-import { autorizacion, parseAutorizacion } from './sri';
+import { autorizacion, parseAutorizacion,recepcion } from './sri';
+import { getSriUrls } from './sri-config';
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -303,50 +304,94 @@ app.post('/api/v1/credit-notes/emit', async (req, res) => {
 app.get('/api/v1/invoices/:accessKey/status', async (req, res) => {
   try {
     const { accessKey } = req.params;
-    const { env } = req.query as { env?: 'test'|'prod' };
+    const { env } = req.query as { env: 'test' | 'prod' };
 
     if (!/^\d{49}$/.test(accessKey)) {
-      return res.status(400).json({ status: 'ERROR', messages: ['Clave de acceso inválida.'] });
+      return res.status(400).json({ status: 'ERROR', messages: ['Clave de acceso inválida. Debe tener 49 dígitos.'] });
     }
 
-    const determinedEnv: 'test' | 'prod' = env === 'prod' ? 'prod' : 'test';
-    console.log(`Consultando estado en ambiente: ${determinedEnv}`);
+    // Helper para consultar un ambiente específico
+    const checkEnv = async (amb: 'test' | 'prod') => {
+      const urls = getSriConfig(amb); // <-- usar la util que ya tienes
+      if (!urls.autorizacion) {
+        return {
+          status: 'ERROR' as const,
+          messages: [`URL de autorización no configurada para ambiente: ${amb}`],
+          environment: amb,
+        };
+      }
+	  const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
+  	  
+      const authResponse = await autorizacion(urls.autorizacion, accessKey);
+      const parsed = parseAutorizacion(authResponse);
 
-    const sriConfig = getSriConfig(determinedEnv);
-    if (!sriConfig.autorizacion) {
-      return res.status(500).json({ status: 'ERROR', messages: [`URL de autorización no configurada para ambiente: ${determinedEnv}`] });
-    }
+      if (parsed.estado === 'AUTORIZADO') {
+        return {
+          status: 'AUTHORIZED' as const,
+          accessKey,
+          environment: amb,
+          authorization: { number: parsed.number, date: parsed.date },
+          xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
+        };
+      }
+      if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
+        return {
+          status: 'PROCESSING' as const,
+          accessKey,
+          environment: amb,
+          messages: [parsed.errorMsg || 'El comprobante todavía no tiene autorización (pendiente).'],
+        };
+      }
+      if (parsed.estado === 'NO AUTORIZADO') {
+        return {
+          status: 'NOT_AUTHORIZED' as const,
+          accessKey,
+          environment: amb,
+          messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
+        };
+      }
 
-    const authResponse = await autorizacion(sriConfig.autorizacion, accessKey);
-    const parsed = parseAutorizacion(authResponse);
-
-    if (parsed.estado === 'AUTORIZADO') {
-      return res.json({
-        status: 'AUTHORIZED',
+      return {
+        status: 'UNKNOWN' as const,
         accessKey,
-        environment: determinedEnv,
-        authorization: { number: parsed.number, date: parsed.date },
-        xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
-      });
-    }
-    if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
-      return res.json({
-        status: 'PROCESSING',
-        accessKey,
-        environment: determinedEnv,
-        messages: [parsed.errorMsg || 'El comprobante todavía no tiene autorización (pendiente).'],
-      });
-    }
-    if (parsed.estado === 'NO AUTORIZADO') {
-      return res.json({
-        status: 'NOT_AUTHORIZED',
-        accessKey,
-        environment: determinedEnv,
-        messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
-      });
+        environment: amb,
+        messages: ['Estado de autorización desconocido.'],
+      };
+    };
+
+    // Si el cliente especifica ambiente, consulta solo ese.
+    if (env === 'prod' || env === 'test') {
+      const out = await checkEnv(env);
+      if (out.status === 'ERROR') {
+        return res.status(500).json(out);
+      }
+      return res.json(out);
     }
 
-    return res.json({ status: 'UNKNOWN', accessKey, environment: determinedEnv, messages: ['Estado de autorización desconocido.'] });
+    // Si NO especifica ambiente, intenta PROD y luego TEST,
+    // y elige el "mejor" resultado.
+    const [prodResult, testResult] = await Promise.allSettled([checkEnv('prod'), checkEnv('test')]);
+
+    // Normaliza resultados
+    const results = [prodResult, testResult]
+      .filter(r => r.status === 'fulfilled')
+      .map(r => (r as PromiseFulfilledResult<any>).value);
+
+    if (!results.length) {
+      // Ambos fallaron en nivel de red/config
+      return res.status(500).json({ status: 'ERROR', messages: ['No se pudo consultar SRI en ninguno de los ambientes.'] });
+    }
+
+    // Prioridad: AUTHORIZED > PROCESSING > NOT_AUTHORIZED > UNKNOWN
+    const pickByPriority = (arr: any[]) =>
+      arr.find(r => r.status === 'AUTHORIZED') ||
+      arr.find(r => r.status === 'PROCESSING') ||
+      arr.find(r => r.status === 'NOT_AUTHORIZED') ||
+      arr[0];
+
+    const chosen = pickByPriority(results);
+    return res.json(chosen);
+
   } catch (e: any) {
     console.error('Error al consultar estado:', e);
     return res.status(500).json({ status: 'ERROR', messages: [e?.message || 'Internal Error'] });

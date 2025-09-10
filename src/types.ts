@@ -59,12 +59,14 @@ export interface EmitInvoiceInput {
 }
 
 export interface EmitInvoiceOutput {
-  status: 'AUTHORIZED' | 'PROCESSING' | 'NOT_AUTHORIZED' | 'ERROR';
+  status: 'AUTHORIZED' | 'PROCESSING' | 'NOT_AUTHORIZED' | 'ERROR' | 'DEVUELTA';
   accessKey?: string;
   authorization?: { number: string; date: string };
   xml_signed_base64?: string;
   xml_authorized_base64?: string;
   messages?: string[];
+  payload_hash?: string;
+  
 }
 
 export interface IdempotencyRecord {
