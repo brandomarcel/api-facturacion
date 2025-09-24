@@ -317,6 +317,7 @@ export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
 
   const cached = await getCachedResponse(idempotencyKey);
+  console.log('cached nota credito', cached);
   if (cached && cached.payload_hash === reqHash) return cached;
 
   const { infoTributaria, infoNotaCredito, detalles, infoAdicional, certificate } = payload;
