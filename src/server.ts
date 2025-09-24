@@ -288,7 +288,7 @@ app.post('/api/v1/credit-notes/emit', async (req, res) => {
   
   
     const parsed = creditNoteSchema.safeParse(req.body);
-	console.log('Received payload:', parsed);
+	console.log('Received payload nota de crédito:', parsed);
     if (!parsed.success) {
       return res.status(400).json({ status: 'ERROR', message: 'Formato de datos inválido', issues: parsed.error.errors });
     }
