@@ -128,7 +128,10 @@ export async function emitirFactura(payload: any): Promise<EmitInvoiceOutput> {
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
 
   const cached = await getCachedResponse(idempotencyKey);
-  if (cached && cached.payload_hash === reqHash) return cached;
+  if (cached && cached.payload_hash === reqHash){ 
+  
+  console.log('cache',cached)
+  return cached;}
 
   const { version = DEFAULT_VERSION, infoTributaria, infoFactura, detalles, infoAdicional, certificate } = payload;
   if (!infoTributaria || !infoFactura || !detalles || !certificate) {
@@ -154,32 +157,37 @@ const numericCode =
     const signedXml = await signXML(xml, certificate.p12_base64, certificate.password);
 
     const rec = await recepcion(recepcionUrl, signedXml);
+	 console.log('recepcion',rec)
+	 console.log('isRecibida',isRecibida(rec))
+	 
     if (!isRecibida(rec)) {
+	
       const msgs = parseRecepcionMensajes(rec);
-      const out: CachedResponse = {
+	   console.log('no fue recibida',msgs)
+      // ⛔ Opción B: NO cachear estados transitorios
+      return {
         status: 'ERROR',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: msgs,
         payload_hash: reqHash
       };
-      await setCachedResponse(idempotencyKey, out, 3600);
-      return out;
     }
+	
+	
 
     const auth = await autorizacion(autorizacionUrl, accessKey);
     const parsed = parseAutorizacion(auth);
-
+ console.log('autorizacion',auth)
     if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
-      const out: CachedResponse = {
+      // ⛔ Opción B: NO cachear PROCESSING
+      return {
         status: 'PROCESSING',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
         payload_hash: reqHash
       };
-      await setCachedResponse(idempotencyKey, out, 5 * 60);
-      return out;
     }
     if (parsed.estado === 'NO AUTORIZADO') {
       const out: CachedResponse = {
@@ -251,30 +259,28 @@ export async function emitirFacturaDesdeXML(payload: {
     const rec = await recepcion(recepcionUrl, signedXml);
     if (!isRecibida(rec)) {
       const msgs = parseRecepcionMensajes(rec);
-      const out: CachedResponse = {
+      // ⛔ NO cachear transitorio
+      return {
         status: 'ERROR',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: msgs.length ? msgs : [JSON.stringify(rec)],
         payload_hash: reqHash
       };
-      await setCachedResponse(idempotencyKey, out, 3600);
-      return out;
     }
 
     const auth = await autorizacion(autorizacionUrl, accessKey);
     const parsed = parseAutorizacion(auth);
 
     if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
-      const out: CachedResponse = {
+      // ⛔ NO cachear transitorio
+      return {
         status: 'PROCESSING',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
         payload_hash: reqHash
       };
-      await setCachedResponse(idempotencyKey, out, 5 * 60);
-      return out;
     }
     if (parsed.estado === 'NO AUTORIZADO') {
       const out: CachedResponse = {
@@ -349,30 +355,28 @@ const numericCode =
     const rec = await recepcion(recepcionUrl, signedXml);
     if (!isRecibida(rec)) {
       const msgs = parseRecepcionMensajes(rec);
-      const out: CachedResponse = {
+      // ⛔ NO cachear transitorio
+      return {
         status: 'ERROR',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: msgs,
         payload_hash: reqHash
       };
-      await setCachedResponse(idempotencyKey, out, 3600);
-      return out;
     }
 
     const auth = await autorizacion(autorizacionUrl, accessKey);
     const parsed = parseAutorizacion(auth);
 
     if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
-      const out: CachedResponse = {
+      // ⛔ NO cachear transitorio
+      return {
         status: 'PROCESSING',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
         payload_hash: reqHash
       };
-      await setCachedResponse(idempotencyKey, out, 5 * 60);
-      return out;
     }
     if (parsed.estado === 'NO AUTORIZADO') {
       const out: CachedResponse = {
